@@ -266,63 +266,107 @@ public:
 
 #if ROCKET_LEAGUE
 
+#include "RocketLeagueKeys.h"
+
+struct FRLEncryptedChunk
+{
+	int64 CompressedOffset;
+	int32 CompressedSize;
+	byte  Nonce[12];
+};
+
 class FFileReaderRocketLeague : public FReaderWrapper
 {
 	DECLARE_ARCHIVE(FFileReaderRocketLeague, FReaderWrapper);
 public:
-	int			EncryptionStart;
-	int			EncryptionEnd;
+	int                     EncryptionStart;
+	int                     EncryptionEnd;
+	byte                    Key[32];
+	bool                    bIsFullEncrypted;
+	byte                    HeaderNonce[12];
+	TArray<FRLEncryptedChunk> Chunks;
 
 	FFileReaderRocketLeague(FArchive *File)
 	:	FReaderWrapper(File)
 	,	EncryptionStart(0)
 	,	EncryptionEnd(0)
-	{}
+	,	bIsFullEncrypted(false)
+	{
+		memset(Key, 0, sizeof(Key));
+		memset(HeaderNonce, 0, sizeof(HeaderNonce));
+	}
 
 	virtual void Serialize(void *data, int size)
 	{
 		int Pos = Reader->Tell();
 		Reader->Serialize(data, size);
 
-		// Check if any of the data read was encrypted
-		if (Pos + size <= EncryptionStart || Pos >= EncryptionEnd)
-			return;
+		// 1. Header decryption
+		if (Pos < EncryptionEnd && Pos + size > EncryptionStart)
+		{
+			int StartOffset     = max(0, Pos - EncryptionStart);
+			int EndOffset       = min(EncryptionEnd, Pos + size) - EncryptionStart;
+			int CopySize        = EndOffset - StartOffset;
+			int CopyOffset      = max(0, EncryptionStart - Pos);
 
-		// Determine what needs to be decrypted
-		int StartOffset			= max(0, Pos - EncryptionStart);
-		int EndOffset			= min(EncryptionEnd, Pos + size) - EncryptionStart;
-		int CopySize			= EndOffset - StartOffset;
-		int CopyOffset			= max(0, EncryptionStart - Pos);
+			int BlockStartOffset = StartOffset & ~15;
+			int BlockEndOffset   = Align(EndOffset, 16);
+			int EncryptedSize    = BlockEndOffset - BlockStartOffset;
+			int EncryptedOffset  = StartOffset - BlockStartOffset;
 
-		// Round to 16-byte AES blocks
-		int BlockStartOffset	= StartOffset & ~15;
-		int BlockEndOffset		= Align(EndOffset, 16);
-		int EncryptedSize		= BlockEndOffset - BlockStartOffset;
-		int EncryptedOffset		= StartOffset - BlockStartOffset;
+			byte *EncryptedBuffer = (byte*)(appMalloc(EncryptedSize));
+			Reader->Seek(EncryptionStart + BlockStartOffset);
+			Reader->Serialize(EncryptedBuffer, EncryptedSize);
 
-		// Decrypt and copy
-		static const byte key[] = {
-			0xC7, 0xDF, 0x6B, 0x13, 0x25, 0x2A, 0xCC, 0x71,
-			0x47, 0xBB, 0x51, 0xC9, 0x8A, 0xD7, 0xE3, 0x4B,
-			0x7F, 0xE5, 0x00, 0xB7, 0x7F, 0xA5, 0xFA, 0xB2,
-			0x93, 0xE2, 0xF2, 0x4E, 0x6B, 0x17, 0xE7, 0x79
-		};
+			if (bIsFullEncrypted)
+			{
+				uint32 initialCounter = BlockStartOffset / 16;
+				appDecryptAES_CTR(EncryptedBuffer, EncryptedSize, Key, HeaderNonce, initialCounter);
+			}
+			else
+			{
+				appDecryptAES(EncryptedBuffer, EncryptedSize, (const char*)Key, 32);
+			}
 
-		byte *EncryptedBuffer = (byte*)(appMalloc(EncryptedSize));
-		Reader->Seek(EncryptionStart + BlockStartOffset);
-		Reader->Serialize(EncryptedBuffer, EncryptedSize);
-		appDecryptAES(EncryptedBuffer, EncryptedSize, (char*)(key), ARRAY_COUNT(key));
-		memcpy(OffsetPointer(data, CopyOffset), &EncryptedBuffer[EncryptedOffset], CopySize);
-		appFree(EncryptedBuffer);
+			memcpy(OffsetPointer(data, CopyOffset), &EncryptedBuffer[EncryptedOffset], CopySize);
+			appFree(EncryptedBuffer);
+			Reader->Seek(Pos + size);
+		}
 
-		// Note: this code is absolutely not optimal, because it will read 16 bytes block and fully decrypt
-		// it many times for every small piece of serialized daya (for example if serializing array of bytes,
-		// we'll have full code above executed for each byte, instead of once per block). However, it is assumed
-		// that this reader is used only for decryption of package's header, so it is not so important to
-		// optimize it.
+		// 2. Chunks decryption (for 0x0800 full-encrypted packages)
+		if (bIsFullEncrypted && Chunks.Num() > 0)
+		{
+			for (int c = 0; c < Chunks.Num(); c++)
+			{
+				const FRLEncryptedChunk& chunk = Chunks[c];
+				int chunkStart = (int)chunk.CompressedOffset;
+				int chunkEnd = chunkStart + chunk.CompressedSize;
 
-		// Restore position
-		Reader->Seek(Pos + size);
+				if (Pos < chunkEnd && Pos + size > chunkStart)
+				{
+					int StartOffset     = max(0, Pos - chunkStart);
+					int EndOffset       = min(chunkEnd, Pos + size) - chunkStart;
+					int CopySize        = EndOffset - StartOffset;
+					int CopyOffset      = max(0, chunkStart - Pos);
+
+					int BlockStartOffset = StartOffset & ~15;
+					int BlockEndOffset   = min(Align(EndOffset, 16), chunk.CompressedSize); // clamp to chunk bounds
+					int EncryptedSize     = BlockEndOffset - BlockStartOffset;
+					int EncryptedOffset   = StartOffset - BlockStartOffset;
+
+					byte *EncryptedBuffer = (byte*)(appMalloc(EncryptedSize));
+					Reader->Seek(chunkStart + BlockStartOffset);
+					Reader->Serialize(EncryptedBuffer, EncryptedSize);
+
+					uint32 initialCounter = BlockStartOffset / 16;
+					appDecryptAES_CTR(EncryptedBuffer, EncryptedSize, Key, chunk.Nonce, initialCounter);
+
+					memcpy(OffsetPointer(data, CopyOffset), &EncryptedBuffer[EncryptedOffset], CopySize);
+					appFree(EncryptedBuffer);
+					Reader->Seek(Pos + size);
+				}
+			}
+		}
 	}
 };
 
@@ -514,7 +558,7 @@ void UnPackage::ReplaceLoader()
 		TArray<FString> AdditionalPackagesToCook;
 		*this << AdditionalPackagesToCook;
 
-		// Array of unknown structs
+		// Array of unknown structs (TextureAllocations)
 		int32 NumUnknownStructs;
 		*this << NumUnknownStructs;
 		for (int i = 0; i < NumUnknownStructs; i++)
@@ -525,23 +569,131 @@ void UnPackage::ReplaceLoader()
 		}
 
 		// Info related to encrypted buffer
-		int32 GarbageSize, CompressedChunkInfoOffset, LastBlockSize;
-		*this << GarbageSize << CompressedChunkInfoOffset << LastBlockSize;
+		int32 TestDataSize, CompressedChunkInfoOffset, LastBlockSize;
+		*this << TestDataSize << CompressedChunkInfoOffset << LastBlockSize;
+
+		int32 testA = 0, testB = 0, testC = 0;
+		if (Summary.LicenseeVersion >= 33)
+		{
+			*this << testA << testB << testC;
+		}
+
+		bool bIsFullEncrypted = (Summary.PackageFlags & 0x0800) != 0;
+
+		int HeaderStart = this->Tell();
+
+		int EncryptedHeaderSize = Summary.HeadersSize - (LastBlockSize + HeaderStart);
+		if (EncryptedHeaderSize <= 0)
+			appError("Invalid Rocket League encrypted header size in %s", *GetFilename());
+
+		int TestDataOffset = Summary.HeadersSize - HeaderStart - TestDataSize;
+
+		byte* RawHeader = (byte*)appMalloc(EncryptedHeaderSize);
+		Loader->Seek(HeaderStart);
+		Loader->Serialize(RawHeader, EncryptedHeaderSize);
+
+		byte FoundKey[32];
+		memset(FoundKey, 0, sizeof(FoundKey));
+		bool bKeyFound = false;
+
+		byte HeaderNonce[12];
+		memcpy(HeaderNonce, &testA, 4);
+		memcpy(HeaderNonce + 4, &testB, 4);
+		memcpy(HeaderNonce + 8, &testC, 4);
+
+		TArray<FRocketLeagueKey>& KeyPool = FRocketLeagueKeyManager::GetKeys();
+		byte* TestDecrypted = (byte*)appMalloc(EncryptedHeaderSize);
+
+		for (int k = 0; k < KeyPool.Num(); k++)
+		{
+			memcpy(TestDecrypted, RawHeader, EncryptedHeaderSize);
+			if (bIsFullEncrypted)
+			{
+				appDecryptAES_CTR(TestDecrypted, EncryptedHeaderSize, KeyPool[k].Key, HeaderNonce, 0);
+			}
+			else
+			{
+				int AlignedEncSize = EncryptedHeaderSize & ~15;
+				appDecryptAES(TestDecrypted, AlignedEncSize, (const char*)KeyPool[k].Key, 32);
+			}
+
+			if (FRocketLeagueKeyManager::VerifyDecryptedPackageData(TestDecrypted, EncryptedHeaderSize, TestDataOffset))
+			{
+				memcpy(FoundKey, KeyPool[k].Key, 32);
+				bKeyFound = true;
+				appPrintf("Found AES key: '%s'\n", KeyPool[k].Line);
+				break;
+			}
+		}
+
+		appFree(TestDecrypted);
+		appFree(RawHeader);
+
+		if (!bKeyFound)
+			appError("Unable to find a matching Rocket League AES key in aes.txt for %s", *GetFilename());
 
 		// Create a reader to decrypt the rest of Rocket League's header
 		FFileReaderRocketLeague* RocketReader = new FFileReaderRocketLeague(Loader);
 		RocketReader->SetupFrom(*this);
-		RocketReader->EncryptionStart = Summary.NameOffset;
-		RocketReader->EncryptionEnd = Summary.HeadersSize;
+		RocketReader->EncryptionStart = HeaderStart;
+		RocketReader->EncryptionEnd = HeaderStart + EncryptedHeaderSize;
+		RocketReader->bIsFullEncrypted = bIsFullEncrypted;
+		memcpy(RocketReader->Key, FoundKey, 32);
+		memcpy(RocketReader->HeaderNonce, HeaderNonce, 12);
 
-		// Create a UE3 compression reader with the chunk info contained in the encrypted RL header
+		// Read chunk info
 		RocketReader->Seek(RocketReader->EncryptionStart + CompressedChunkInfoOffset);
 
-		TArray<FCompressedChunk> Chunks;
-		*RocketReader << Chunks;
+		int32 ChunkCount = 0;
+		*RocketReader << ChunkCount;
 
-		Loader = new FUE3ArchiveReader(RocketReader, COMPRESS_ZLIB, Chunks);
-		Loader->SetupFrom(*this);
+		TArray<FCompressedChunk> Chunks;
+
+		if (bIsFullEncrypted)
+		{
+			for (int i = 0; i < ChunkCount; i++)
+			{
+				int64 uo;
+				int32 us;
+				int64 co;
+				int32 cs;
+				byte chunkNonce[12];
+				*RocketReader << uo << us << co << cs;
+				RocketReader->Serialize(chunkNonce, 12);
+
+				FCompressedChunk ch;
+				ch.UncompressedOffset = (int)uo;
+				ch.UncompressedSize = us;
+				ch.CompressedOffset = (int)co;
+				ch.CompressedSize = cs;
+				Chunks.Add(ch);
+
+				FRLEncryptedChunk encChunk;
+				encChunk.CompressedOffset = co;
+				encChunk.CompressedSize = cs;
+				memcpy(encChunk.Nonce, chunkNonce, 12);
+				RocketReader->Chunks.Add(encChunk);
+			}
+		}
+		else
+		{
+			for (int i = 0; i < ChunkCount; i++)
+			{
+				FCompressedChunk ch;
+				*RocketReader << ch;
+				Chunks.Add(ch);
+			}
+		}
+
+		if (Chunks.Num() > 0)
+		{
+			Loader = new FUE3ArchiveReader(RocketReader, COMPRESS_ZLIB, Chunks);
+			Loader->SetupFrom(*this);
+		}
+		else
+		{
+			Loader = RocketReader;
+		}
 
 		// The decompressed chunks will overwrite past CompressedChunkInfoOffset, so don't decrypt past that anymore
 		RocketReader->EncryptionEnd = RocketReader->EncryptionStart + CompressedChunkInfoOffset;

@@ -538,7 +538,7 @@ restart_decompress:
 
 //todo: move to UnCoreDecrypt.cpp
 
-#if UNREAL4
+#if UNREAL4 || ROCKET_LEAGUE
 
 TArray<FString> GAesKeys;
 
@@ -575,4 +575,36 @@ void appDecryptAES(byte* Data, int Size, const char* Key, int KeyLen)
 	unguard;
 }
 
-#endif // UNREAL4
+void appDecryptAES_CTR(byte* Data, int Size, const byte* Key, const byte* Nonce12, uint32 InitialCounter)
+{
+	guard(appDecryptAES_CTR);
+
+	unsigned long rk[RKLENGTH(AES_KEYBITS)];
+	int nrounds = rijndaelSetupEncrypt(rk, Key, AES_KEYBITS);
+
+	byte counter_block[16];
+	byte keystream[16];
+	memcpy(counter_block, Nonce12, 12);
+
+	uint32 counter = InitialCounter;
+	for (int pos = 0; pos < Size; pos += 16)
+	{
+		counter_block[12] = (byte)(counter >> 24);
+		counter_block[13] = (byte)(counter >> 16);
+		counter_block[14] = (byte)(counter >> 8);
+		counter_block[15] = (byte)(counter);
+		counter++;
+
+		rijndaelEncrypt(rk, nrounds, counter_block, keystream);
+
+		int blockSize = min(16, Size - pos);
+		for (int i = 0; i < blockSize; i++)
+		{
+			Data[pos + i] ^= keystream[i];
+		}
+	}
+
+	unguard;
+}
+
+#endif // UNREAL4 || ROCKET_LEAGUE

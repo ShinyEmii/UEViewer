@@ -2719,6 +2719,7 @@ extern TArray<FString> GAesKeys;
 
 // Decrypt with arbitrary key
 void appDecryptAES(byte* Data, int Size, const char* Key, int KeyLen = -1);
+void appDecryptAES_CTR(byte* Data, int Size, const byte* Key, const byte* Nonce12, uint32 InitialCounter = 0);
 
 // Callback called when encrypted pak file is attempted to load
 bool UE4EncryptedPak();
