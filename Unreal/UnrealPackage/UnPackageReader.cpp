@@ -344,8 +344,6 @@ public:
 
 				if (Pos < chunkEnd && Pos + size > chunkStart)
 				{
-					bAnyChunkMatched = true;
-
 					int StartOffset     = max(0, Pos - chunkStart);
 					int EndOffset       = min(chunkEnd, Pos + size) - chunkStart;
 					int CopySize        = EndOffset - StartOffset;
