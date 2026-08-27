@@ -344,6 +344,8 @@ public:
 
 				if (Pos < chunkEnd && Pos + size > chunkStart)
 				{
+					bAnyChunkMatched = true;
+
 					int StartOffset     = max(0, Pos - chunkStart);
 					int EndOffset       = min(chunkEnd, Pos + size) - chunkStart;
 					int CopySize        = EndOffset - StartOffset;
@@ -679,9 +681,31 @@ void UnPackage::ReplaceLoader()
 		{
 			for (int i = 0; i < ChunkCount; i++)
 			{
-				FCompressedChunk ch;
-				*RocketReader << ch;
-				Chunks.Add(ch);
+				// Even if no flag for AES CTR theres still a nonce
+				if (ArLicenseeVer >= 33)
+				{
+					int64 uo;
+					int32 us;
+					int64 co;
+					int32 cs;
+
+					byte chunkNonce[12];
+					*RocketReader << uo << us << co << cs;
+					RocketReader->Serialize(chunkNonce, 12);
+
+					FCompressedChunk ch;
+					ch.UncompressedOffset = (int)uo;
+					ch.UncompressedSize = us;
+					ch.CompressedOffset = (int)co;
+					ch.CompressedSize = cs;
+					Chunks.Add(ch);
+				}
+				else
+				{
+					FCompressedChunk ch;
+					*RocketReader << ch;
+					Chunks.Add(ch);
+				}
 			}
 		}
 

@@ -87,6 +87,7 @@ public:
 			}
 			// here: data/size points outside of loaded Buffer
 			PrepareBuffer(Position);
+
 			assert(Position >= BufferStart && Position < BufferEnd);	// validate PrepareBuffer()
 		}
 
@@ -160,6 +161,7 @@ public:
 		// find block in ChunkHeader.Blocks
 		int ChunkPosition = Chunk->UncompressedOffset;
 		int ChunkData     = ChunkDataPos;
+
 		assert(ChunkPosition <= Pos);
 		const FCompressedChunkBlock *Block = NULL;
 		for (int BlockIndex = 0; BlockIndex < ChunkHeader.Blocks.Num(); BlockIndex++)
